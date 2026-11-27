@@ -19,6 +19,7 @@
 - 先定向测试、构建与独立安全复核，再在隔离 HOME、私有 tmux 中验证二进制
 - `bun run build` 只构建，不认领全局运行入口；不要在开发或审查工作树启动真实 daemon
 - 临时探针一律经 `bun scripts/fenced-run.ts -- <命令>`，按 `AGENTS.md` 保留围栏
+- `.github/workflows/fork-check.yml` 只对个人 `main` 推送或手工运行，覆盖 Linux/macOS 的相关回归、构建和独立二进制启动；不发布、不上传长期制品、不部署
 
 版本号由正式发布流程设置，不手工改源码中的 `package.json.version`；本地候选可使用构建脚本支持的 `BOTMUX_VERIFY_BAKED_VERSION` 标记来源
 
