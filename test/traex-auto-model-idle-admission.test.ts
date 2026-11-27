@@ -9,6 +9,8 @@ import { finalizeRawCommandDelivery } from '../src/core/raw-command-writer.js';
 import { programStatusBlockHoldsTypeAhead } from '../src/core/program-status-gate.js';
 import { pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js';
 import { sendTuiKeySequence, submitTuiTextInput } from '../src/utils/tui-input-delivery.js';
+import { IdleDetector } from '../src/utils/idle-detector.js';
+import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -49,6 +51,68 @@ function idleAdmissionHarness() {
   scope.cliAdapter.writeInput = vi.fn(async () => ({ submitted: true }));
   return h;
 }
+
+function nativeResumeAdmissionHarness() {
+  const h = idleAdmissionHarness();
+  const { scope } = h;
+  const detector = new IdleDetector(createCliAdapterSync('traex'));
+  scope.idleDetector = detector;
+  scope.pendingInputAllowsTypeAhead = pendingInputAllowsTypeAhead;
+  scope.programStatusBlockHoldsTypeAhead = programStatusBlockHoldsTypeAhead;
+  scope.programStatusBlockedHoldsTypeAhead = loadWorkerFunction('programStatusBlockedHoldsTypeAhead', scope);
+  scope.cliAdapter.programStatusBlockedHoldsInput = true;
+  // A native wake starts after a Botmux-owned input cycle has ended. Use the
+  // real detector to retire the predecessor, including its stale root report.
+  detector.reset({ inputCycle: true });
+  detector.observeProgramStatus({ state: 'working' });
+  detector.fireIdle();
+  scope.isPromptReady = false;
+  detector.onBusy(() => scope.revokePromptReadiness());
+  scope.backend.captureViewportAsync.mockResolvedValue('◆ Working… (1s • esc to interrupt)');
+  return { ...h, detector };
+}
+
+describe('auto-model admission while a native TraeX turn resumes', () => {
+  it('submits an ordinary follow-up during native working without inventing prompt readiness', async () => {
+    vi.useFakeTimers();
+    const h = nativeResumeAdmissionHarness();
+    expect(h.detector.lastProgramStatusReport()).toBe('working');
+    expect(h.detector.programStatusHeldWorking()).toBe(false);
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    // This new accepted native report, not the old lastRootReport, admits it.
+    h.detector.observeProgramStatus({ state: 'working' });
+    await vi.advanceTimersByTimeAsync(25);
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(h.scope.pendingMessages).toEqual([]);
+    expect(h.scope.isPromptReady).toBe(false);
+    expect(h.scope.traexAutoModelController.currentTurnId()).toBe('previous');
+  });
+
+  it.each(['done', 'idle', 'clear'] as const)('holds the composer gap after native %s', async state => {
+    const h = nativeResumeAdmissionHarness();
+    h.detector.observeProgramStatus({ state: 'working' });
+    h.detector.observeProgramStatus({ state });
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+  });
+
+  it.each(['approval', 'capacity', 'serial', 'durable', 'unknown viewport'] as const)('preserves the %s hold during native working', async gate => {
+    const h = nativeResumeAdmissionHarness();
+    h.detector.observeProgramStatus({ state: 'working' });
+    if (gate === 'approval') h.detector.observeProgramStatus({ state: 'blocked', kind: 'approval' });
+    if (gate === 'capacity') h.scope.backend.captureViewportAsync.mockResolvedValue('◆ Queued for capacity (2s • esc to interrupt)');
+    if (gate === 'unknown viewport') h.scope.backend.captureViewportAsync.mockResolvedValue('loading');
+    if (gate === 'serial') h.scope.pendingMessages[0].queueAfterActiveTurn = true;
+    if (gate === 'durable') h.scope.pendingMessages[0].dispatchAttempt = 1;
+    await h.flush();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(h.scope.pendingMessages).toHaveLength(1);
+    expect(h.scope.isPromptReady).toBe(false);
+  });
+});
 
 describe('idle auto-model input after a transient admission refusal', () => {
   it('uses the real timeout and retry timer to recover without another idle event', async () => {

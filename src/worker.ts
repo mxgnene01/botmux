@@ -8666,12 +8666,16 @@ function resetTraexAutoModelBeforePendingTurn(): boolean {
   // never a correction. Writing it in that window both mis-attributes it to the
   // predecessor turn and, with per-turn reselection enabled, skips the
   // preferred-model reset below (that branch runs only once prompt is ready).
-  // Hold for the real idle/composer edge regardless of pool position; the edge
-  // re-drives this flush, which then switches model if configured and writes
-  // the message as its own turn.
+  // A native child-agent wake can start working after that release without a
+  // new Botmux input/authority. The detector's CURRENT accepted working hold
+  // (not its stale last root report) identifies a busy steer, not this composer
+  // gap. Keep the normal viewport, capacity, approval and serial-input gates.
+  // Otherwise the real idle/composer edge re-drives this flush, which switches
+  // model if configured and writes the message as its own turn.
   if (!isPromptReady
     && !activeTurnAuthority.snapshot()
-    && queuedTypeAheadTurns.length === 0) return true;
+    && queuedTypeAheadTurns.length === 0
+    && idleDetector?.programStatusHeldWorking() !== true) return true;
   if (!isPromptReady) return traexAutoModelInputHold();
   if (admitTraexCatalogModelBeforeInput(head.turnId, head.dispatchAttempt)) return true;
   if (controller.config.trigger === 'quota') return selectTraexQuotaModelBeforeTurn(head);
