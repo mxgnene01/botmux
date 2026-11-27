@@ -17,6 +17,26 @@ import { tmpdir } from 'node:os';
 import { traeHistoryPath } from '../src/services/traex-paths.js';
 import { traexQuestionFlowVisible } from '../src/utils/traex-question-page.js';
 import { ProgramStatusFramingStream } from '../src/utils/program-status-parser.js';
+import { setImmediate } from 'node:timers';
+
+// Capture the real turn boundary BEFORE fake timers are installed. Advancing
+// fake time by zero only drains one microtask in Bun's Vitest compatibility
+// layer; it does not prove a later async viewport/adapter stage was reached.
+const yieldAsyncTurn = setImmediate;
+async function waitForAsyncBoundary(reached: () => boolean, label: string): Promise<void> {
+  for (let turn = 0; turn < 64; turn++) {
+    if (reached()) return;
+    // Do not advance the fake 200ms paste → Enter timer to wait for paste.
+    await new Promise<void>(resolve => yieldAsyncTurn(resolve));
+  }
+  throw new Error(`Async boundary not reached: ${label}`);
+}
+
+async function settleTriggeredFlushes(scope: Record<string, any>): Promise<void> {
+  // onPtyData fires and forgets the real flush. Await its actual returned
+  // promises, not an assumed number of microtasks or extra fake milliseconds.
+  await Promise.all(scope.flushPending.mock.results.map((result: { value: unknown }) => result.value));
+}
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -99,7 +119,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
     });
     expect(detector.programStatusHeldWorking()).toBe(true);
     loadWorkerFunction('onPtyData', scope)(`\x1b]7501;${payload}\x1b\\`, live);
-    await vi.advanceTimersByTimeAsync(0);
+    await settleTriggeredFlushes(scope);
     expect(scope.flushPending).toHaveBeenCalledTimes(accepted ? 1 : 0);
     expect(scope.cliAdapter.writeInput).toHaveBeenCalledTimes(accepted ? 1 : 0);
     expect(scope.pendingMessages).toHaveLength(accepted ? 0 : 1);
@@ -115,7 +135,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
       flushPending: vi.fn(h.flush),
     });
     loadWorkerFunction('onPtyData', h.scope)('\x1b]7501;state=working:app=traecli\x1b\\');
-    await vi.advanceTimersByTimeAsync(0);
+    await settleTriggeredFlushes(h.scope);
     expect(detector.lastProgramStatusReport()).toBe('working');
     expect(detector.programStatusHeldWorking()).toBe(false);
     expect(h.scope.flushPending).not.toHaveBeenCalled();
@@ -141,7 +161,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
     const h = nativeResumeAdmissionHarness();
     const { scope, detector } = h;
     detector.observeProgramStatus({ state: 'working' });
-    scope.flushPending = h.flush;
+    scope.flushPending = vi.fn(h.flush);
     scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
     scope.programStatusStream = new ProgramStatusFramingStream();
     scope.spawnArgvNeedsWorkingSeed = false;
@@ -152,7 +172,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
     let release!: (screen: string) => void;
     scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
     const pending = h.flush();
-    await vi.advanceTimersByTimeAsync(0);
+    await waitForAsyncBoundary(() => scope.backend.captureViewportAsync.mock.calls.length > 0, 'native viewport capture');
     report('blocked', 'permission');
     release('◆ Working… (1s • esc to interrupt)');
     await pending;
@@ -161,7 +181,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
     expect(scope.pendingMessages).toHaveLength(1);
     report('clear');
     if (owner === 'root') report('working');
-    await vi.advanceTimersByTimeAsync(0);
+    await settleTriggeredFlushes(scope);
     expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
     expect(scope.pendingMessages).toEqual([]);
     expect(scope.isPromptReady).toBe(false);
@@ -174,13 +194,13 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
     const h = nativeResumeAdmissionHarness();
     const { scope, detector } = h;
     detector.observeProgramStatus({ state: 'working' });
-    scope.flushPending = h.flush;
+    scope.flushPending = vi.fn(h.flush);
     scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
     const head = scope.pendingMessages[0];
     let release!: (screen: string) => void;
     scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
     const pending = h.flush();
-    await vi.advanceTimersByTimeAsync(0);
+    await waitForAsyncBoundary(() => scope.backend.captureViewportAsync.mock.calls.length > 0, 'native viewport capture');
     expect(scope.backend.captureViewportAsync).toHaveBeenCalledOnce();
     const readinessRevision = scope.promptReadinessRevision;
     detector.observeProgramStatus({ state: 'blocked', ...(kind !== undefined ? { kind } : {}), ...(owner === 'child' ? { id: 'approval-child' } : {}) });
@@ -199,6 +219,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
       detector.observeProgramStatus({ state: 'working' });
     }
     await vi.advanceTimersByTimeAsync(201);
+    await settleTriggeredFlushes(scope);
     expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
     expect(scope.pendingMessages).toEqual([]);
     expect(scope.isPromptReady).toBe(false);
@@ -211,7 +232,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
     const h = nativeResumeAdmissionHarness();
     const { scope, detector } = h;
     detector.observeProgramStatus({ state: 'working' });
-    scope.flushPending = h.flush;
+    scope.flushPending = vi.fn(h.flush);
     scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
     const head = scope.pendingMessages[0];
     let release!: (result: any) => void;
@@ -227,7 +248,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
         .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
     }
     const pending = h.flush();
-    await vi.advanceTimersByTimeAsync(0);
+    await waitForAsyncBoundary(() => awaited.mock.calls.length > 0, phase);
     expect(awaited).toHaveBeenCalledOnce();
     const readinessRevision = scope.promptReadinessRevision;
     detector.observeProgramStatus({ state: 'blocked', ...(kind !== undefined ? { kind } : {}) });
@@ -239,6 +260,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
     detector.observeProgramStatus({ state: 'clear' });
     detector.observeProgramStatus({ state: 'working' });
     await vi.advanceTimersByTimeAsync(201);
+    await settleTriggeredFlushes(scope);
     expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
     expect(scope.pendingMessages).toEqual([]);
     expect(scope.isPromptReady).toBe(false);
@@ -269,7 +291,7 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
       let release!: (screen: string) => void;
       scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
       const pending = h.flush();
-      await vi.advanceTimersByTimeAsync(0);
+      await waitForAsyncBoundary(() => scope.backend.captureViewportAsync.mock.calls.length > 0, 'native viewport capture');
       const readinessRevision = scope.promptReadinessRevision;
       detector.observeProgramStatus({ state: 'blocked', kind: 'permission' });
       expect(detector.programStatusBlock()).toMatchObject({ kind: 'permission' });
@@ -336,16 +358,21 @@ describe('auto-model admission while a native TraeX turn resumes', () => {
         let settled = false;
         const pending = createCliAdapterSync('traex').writeInput(scope.backend, input, { submitGuard: guard })
           .then(result => { settled = true; return result; });
-        await vi.advanceTimersByTimeAsync(0);
+        await waitForAsyncBoundary(() => writes.length > 0 || settled, 'actual native paste');
         expect(writes).toHaveLength(1);
+        expect(writes[0].text).toContain('[200~');
         expect(writes[0].block).toBeNull();
+        expect(settled).toBe(false);
         if (duringCapture) {
           await vi.advanceTimersByTimeAsync(200);
+          await waitForAsyncBoundary(() => capture.mock.calls.length > 0 || settled, 'pre-Enter viewport capture');
           expect(capture).toHaveBeenCalledOnce();
         }
         detector.observeProgramStatus({ state: 'blocked', ...(kind !== undefined ? { kind } : {}) });
         if (duringCapture) releaseCapture(nativeWorking);
         await vi.advanceTimersByTimeAsync(duringCapture ? 50 : 250);
+        await waitForAsyncBoundary(() => scope.traexQuestionDraftWaiting === true
+          || writes.some(write => write.text === 'Enter') || settled, 'draft hold or native submission');
         expect(writes.filter(write => write.text === 'Enter')).toEqual([]);
         expect(writes.filter(write => write.text.includes('[200~'))).toHaveLength(1);
         expect(settled).toBe(false);
@@ -409,7 +436,7 @@ describe('idle auto-model input after a transient admission refusal', () => {
   it('uses the real timeout and retry timer to recover without another idle event', async () => {
     vi.useFakeTimers();
     const h = idleAdmissionHarness();
-    h.scope.flushPending = h.flush;
+    h.scope.flushPending = vi.fn(h.flush);
     h.scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', h.scope);
     h.scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise(() => {}));
     const first = h.flush();
@@ -417,6 +444,7 @@ describe('idle auto-model input after a transient admission refusal', () => {
     await first;
     expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(200);
+    await settleTriggeredFlushes(h.scope);
     expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
     expect(h.scope.pendingMessages).toEqual([]);
     await vi.advanceTimersByTimeAsync(2_000);
