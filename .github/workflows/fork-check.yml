@@ -61,6 +61,11 @@ jobs:
             test/session-discovery.test.ts
             test/traex-auto-model-idle-admission.test.ts
             test/submit-provisional-attribution.test.ts
+            test/traex-question-hold-wiring.test.ts
+            test/traex-question-bridge.test.ts
+            test/traex-async-question.test.ts
+            test/program-status-codex-traex.test.ts
+            test/worker-submit-program-status.test.ts
           )
           shopt -s nullglob
           files+=(test/traex-native-resume*.test.ts)
