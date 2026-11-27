@@ -66,6 +66,11 @@ jobs:
             test/traex-async-question.test.ts
             test/program-status-codex-traex.test.ts
             test/worker-submit-program-status.test.ts
+            test/program-status-idle.test.ts
+            test/program-status-pipeline.test.ts
+            test/stale-program-status.test.ts
+            test/worker-traex-program-status.integration.test.ts
+            test/worker-codex-program-status.integration.test.ts
           )
           shopt -s nullglob
           files+=(test/traex-native-resume*.test.ts)
