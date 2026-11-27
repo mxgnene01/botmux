@@ -10,6 +10,9 @@ import { readJsonLines } from './helpers/read-json-lines.js';
 import type { WorkerToDaemon } from '../src/types.js';
 
 const tmuxAvailable = probeTmuxFunctional().ok;
+// Module loading and CLI/tmux initialization have separate startup budgets.
+// Neither consumes the native-wake follow-up's six-second delivery bound.
+const CLI_BOOTSTRAP_TIMEOUT_MS = SOURCE_WORKER_LOAD_TIMEOUT_MS;
 
 for (const backendType of ['pty', 'tmux'] as const) {
   it.skipIf(backendType === 'tmux' && !tmuxAvailable)(
@@ -124,9 +127,10 @@ if (process.argv[2] === 'app-server') {
           traexAutoModel: { enabled: true, trigger: 'capacity', models: ['core', 'backup'],
             queueTimeoutMs: 5_000, reselectPerTurn: false, preflightLoadCheck: false },
         });
-        await wait(() => messages.some(m => m.type === 'turn_terminal' && m.turnId === 'om_first'), 'first terminal');
-        await wait(() => messages.findLastIndex(m => m.type === 'prompt_ready')
-          > messages.findIndex(m => m.type === 'turn_terminal' && m.turnId === 'om_first'), 'first composer ready');
+        await wait(() => {
+          const terminal = messages.findIndex(m => m.type === 'turn_terminal' && m.turnId === 'om_first');
+          return terminal >= 0 && messages.findLastIndex(m => m.type === 'prompt_ready') > terminal;
+        }, 'bootstrap first terminal and composer ready', CLI_BOOTSTRAP_TIMEOUT_MS);
         const beforeWake = messages.length;
         writeFileSync(wake, '1');
         await wait(() => existsSync(started) && messages.slice(beforeWake).some(m => m.type === 'screen_update' && m.status === 'working'), 'native working observed');
@@ -153,6 +157,6 @@ if (process.argv[2] === 'app-server') {
         rmSync(root, { recursive: true, force: true });
       }
     },
-    SOURCE_WORKER_LOAD_TIMEOUT_MS + 50_000,
+    SOURCE_WORKER_LOAD_TIMEOUT_MS + CLI_BOOTSTRAP_TIMEOUT_MS + 50_000,
   );
 }
