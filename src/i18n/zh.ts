@@ -1936,6 +1936,8 @@ export const messages: Record<string, string> = {
   'worker.traex_question.input_held': '⏸ {cliName} 正在等你回答它的追问。为避免消息被填进追问页的备注栏、误提交推荐选项，BotMux 已暂存这条消息：请在问题卡片上选择，或在卡片里填写自定义回答（没看到卡片时请在 Web 终端作答）。追问回答完后，暂存的消息会自动发送。',
   'worker.traex_question.draft_waiting': '⏸ {cliName} 在这条消息按回车前弹出了追问页。消息已经在输入框里了，为免回车替你选中追问页上的推荐选项，先不提交：请在问题卡片上回答追问（没看到卡片时在 Web 终端作答），答完后这条消息会自动提交。',
   'worker.traex_question.submit_blocked': '{cliName} 的追问页挡在这条消息的回车前面太久，消息没有提交（可能还留在输入框里）。请先在问题卡片上回答，再到 Web 终端检查输入框；需要时重新发送前先清掉输入框里的残留。',
+  'worker.traex_native_input.draft_waiting': '⏸ {cliName} 在这条消息按回车前弹出了需要人工处理的权限、认证或其他交互界面。消息已经在输入框里，暂不提交；请先在终端处理该界面，解除阻塞后会提交同一份消息，不会重复粘贴。',
+  'worker.traex_native_input.submit_blocked': '{cliName} 的交互界面挡住了这条消息的回车，等待超时后消息仍未提交，可能还留在输入框里。请先处理终端界面并检查输入框；重新发送前先清理残留，避免重复或拼接。',
   'worker.traex_question.not_written': '⚠️ 卡片上的回答没有写入 {cliName}：写入前追问页已变化（可能已在终端作答、已中断，或备注栏里有别人输入的内容）。如仍需回答，请使用新弹出的卡片或在 Web 终端作答。',
   'worker.traex_question.write_failed': '⚠️ 卡片上的回答没能写入 {cliName} 的追问页（写入没生效或终端拒绝了按键），追问页已尽量恢复原样。请在新弹出的卡片上重新作答，或在 Web 终端作答。',
   'worker.traex_question.notes_hidden': '⚠️ {cliName} 的终端窗口太矮，追问页的备注栏显示不出来，自定义回答没法安全写入（已关掉打开的备注栏）。请在卡片上选择选项，或在 Web 终端作答（也可以把终端窗口调高）。',

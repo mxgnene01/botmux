@@ -24867,8 +24867,8 @@ const TRAEX_QUESTION_DRAFT_POLL_MS = 500;
 let traexQuestionDraftWaiting = false;
 
 /** WriteInputContext.submitGuard for TraeX terminal sessions: right before a
- *  message's Enter, has TRAE's question page taken the input surface (OSC
- *  report, or the page on a fresh screen)? Then the Enter would answer it.
+ *  message's Enter, has a native permission/auth block or TRAE's question page
+ *  taken the input surface? Then the Enter would answer it.
  *  Bound to the CLI the write started on; the sender is told once when the
  *  pasted message has to wait for the question. */
 function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>): SubmitGuard {
@@ -24890,29 +24890,41 @@ function traexQuestionSubmitGuard(item: Pick<PendingCliInput, 'turnId' | 'dispat
       );
     },
     blocked: async phase => {
-      if (!current() || !traexQuestionBridgeActive()) {
+      if (!current()) {
         traexQuestionDraftWaiting = false;
         return undefined;
       }
-      let blocked = traexQuestionBlockReported();
-      if (!blocked) {
+      let nativeBlocked = programStatusBlockedHoldsTypeAhead();
+      const questionBridgeActive = traexQuestionBridgeActive();
+      let questionBlocked = questionBridgeActive && traexQuestionBlockReported();
+      if (!nativeBlocked && !questionBlocked && questionBridgeActive) {
         const screen = await traexQuestionCapture();
-        blocked = !!screen && traexQuestionFlowVisible(screen);
+        if (!current()) {
+          traexQuestionDraftWaiting = false;
+          return undefined;
+        }
+        // A permission can arrive while the question viewport is being read.
+        // It also owns Enter, even if that old viewport still says working.
+        nativeBlocked = programStatusBlockedHoldsTypeAhead();
+        questionBlocked = !!screen && traexQuestionFlowVisible(screen);
       }
+      const blocked = nativeBlocked || questionBlocked;
       if (phase === 'draft') traexQuestionDraftWaiting = !!blocked;
       if (!blocked) return undefined;
       if (phase === 'draft' && !toldWaiting) {
         toldWaiting = true;
-        log('TraeX question page appeared before a message\'s Enter; the message waits in the composer');
+        log('TraeX native input gate appeared before a message\'s Enter; the message waits in the composer');
         send({
           type: 'user_notify',
           turnId: item.turnId ?? currentBotmuxTurnId,
           dispatchAttempt: item.dispatchAttempt,
-          message: t('worker.traex_question.draft_waiting', { cliName: cliName() }),
+          message: t(nativeBlocked ? 'worker.traex_native_input.draft_waiting'
+            : 'worker.traex_question.draft_waiting', { cliName: cliName() }),
         });
-        traexQuestionBridge.kick();
+        if (questionBlocked && !nativeBlocked) traexQuestionBridge.kick();
       }
-      return t('worker.traex_question.submit_blocked', { cliName: cliName() });
+      return t(nativeBlocked ? 'worker.traex_native_input.submit_blocked'
+        : 'worker.traex_question.submit_blocked', { cliName: cliName() });
     },
   };
 }
@@ -27632,6 +27644,14 @@ function onPtyData(data: string, isLiveStream = true): void {
         // accepted status report is the evidence the CLI took the handshake.
         log(`[program-status] status received (state=${part.event.state}); authority engaged`);
       }
+      // A blocked native wake can outlive the admission retry. Working/clear
+      // need not emit onBusy when the detector was already busy: re-drive the
+      // retained head from this accepted state edge, through ALL flush gates.
+      if ((part.event.state === 'working' || part.event.state === 'clear')
+        && lastInitConfig?.cliId === 'traex' && traexAutoModelRuntimeEligible()
+        && pendingMessages.length > 0 && idleDetector?.programStatusHeldWorking() === true) {
+        void flushPending();
+      }
       // TRAE reports its question page as it draws it: look at the screen
       // once the renderer has the page.
       if (traexQuestionBlockReported() && traexQuestionBridgeActive()) traexQuestionBridge.kick();
@@ -30285,6 +30305,9 @@ async function admitTraexAutoModelPendingInput(item: PendingCliInput): Promise<b
     if (!current() || backendScreenRevision !== revision || observedPaneGridRevision !== gridRevision
       || commandLineWritesPending > 0 || injectionFlushing || sessionRenameInFlight()
       || currentInputDeliveryQuarantine() || currentPostTerminalInputFence()
+      // Working → approval need not emit onBusy or change a screen revision.
+      // The captured working viewport cannot overrule the CURRENT native gate.
+      || programStatusBlockedHoldsTypeAhead()
       || shouldDeferUserFlush(pendingInjections) || activeTurnBlocks(item)) return hold();
     if (!screen || traexCapacityQueueVisible(screen) || cliAdapter?.startupPendingPattern?.test(screen)) return hold();
     const progressing = traexModelProgressVisible(screen) || traexQueuedTypeAheadVisible(screen);
@@ -31079,6 +31102,13 @@ async function flushPending(): Promise<void> {
       if (codexRpcEngine?.activeNativeTurnId && catalogAdmissionHead
         && !hybridRpcInputMaySteer(catalogAdmissionHead, codexRpcEngine.activeNativeTurnId)) {
         keepPromptReadyAfterHold();
+        break;
+      }
+      // Composer/question checks can await after model admission. Recheck the
+      // current native gate at the last pre-dequeue edge; never lose this head.
+      if (traexAutoModelRuntimeEligible() && programStatusBlockedHoldsTypeAhead()) {
+        keepPromptReadyAfterHold();
+        retryTraexAutoModelAdmission();
         break;
       }
       const item = freshnessInputQueue.takeNormal();

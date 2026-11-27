@@ -54,6 +54,7 @@ import { contractTerminalStatus, executionObserverSupported } from '../../src/se
 import * as runtimeReservation from '../../src/services/runtime-reservation.js';
 import { isRemoteBackendType } from '../../src/core/persistent-backend.js';
 import { traexQuestionFlowVisible } from '../../src/utils/traex-question-page.js';
+import { programStatusBlockHoldsTypeAhead } from '../../src/core/program-status-gate.js';
 import { antigravityBlockingPageTail } from '../../src/utils/antigravity-blocking-page.js';
 import { isNativeReasoningEffort } from '../../src/services/native-reasoning-observation.js';
 import { readNativeReasoningFooter } from '../../src/utils/native-reasoning-footer.js';
@@ -133,6 +134,7 @@ const FAILED_TURN_REWIND_FUNCTIONS = [
  *  src/worker.ts "TraeX native question page"): loaded as the real functions,
  *  so a fixture without a question page keeps its old behaviour. */
 const TRAEX_QUESTION_FUNCTIONS = [
+  'programStatusBlockedHoldsTypeAhead',
   'traexQuestionBridgeActive', 'traexQuestionBlockReported', 'traexQuestionHoldBlocks',
   'traexQuestionHoldsHeldInput', 'notifyTraexQuestionInputHeld', 'traexQuestionHoldsIdle',
   'traexQuestionHoldsQueuedWrite', 'traexQuestionCapture',
@@ -378,6 +380,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
   const dependencies = new Map<string, unknown>();
   const resolve = (key: string | symbol): unknown => {
     if (key in scope) return scope[key as string];
+    if (key === 'programStatusBlockHoldsTypeAhead') return programStatusBlockHoldsTypeAhead;
     if (key === 'ClaudePermissionNoticeTracker') return ClaudePermissionNoticeTracker;
     if (key === 'captureClaudePermissionNoticeScreen') {
       if (!dependencies.has(key)) dependencies.set(key, loadWorkerFunction(key, scope));

@@ -11,6 +11,12 @@ import { pendingInputAllowsTypeAhead } from '../src/utils/pending-input-queue.js
 import { sendTuiKeySequence, submitTuiTextInput } from '../src/utils/tui-input-delivery.js';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { createCliAdapterSync } from '../src/adapters/cli/registry.js';
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { traeHistoryPath } from '../src/services/traex-paths.js';
+import { traexQuestionFlowVisible } from '../src/utils/traex-question-page.js';
+import { ProgramStatusFramingStream } from '../src/utils/program-status-parser.js';
 
 afterEach(() => { vi.useRealTimers(); });
 
@@ -73,6 +79,247 @@ function nativeResumeAdmissionHarness() {
 }
 
 describe('auto-model admission while a native TraeX turn resumes', () => {
+  it.each(['permission', 'auth', undefined])('refuses the admission snapshot itself when blocked (%s) arrives during capture', async kind => {
+    const h = nativeResumeAdmissionHarness();
+    h.detector.observeProgramStatus({ state: 'working' });
+    const head = h.scope.pendingMessages[0];
+    let release!: (screen: string) => void;
+    h.scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const admission = h.scope.admitTraexAutoModelPendingInput(head);
+    h.detector.observeProgramStatus({ state: 'blocked', ...(kind !== undefined ? { kind } : {}) });
+    release('◆ Working… (1s • esc to interrupt)');
+    expect(await admission).toBe(false);
+    expect(h.scope.pendingMessages).toEqual([head]);
+  });
+
+  it.each(['root', 'child'] as const)('redrives a retained input from native %s release after its earlier retry has elapsed', async owner => {
+    vi.useFakeTimers();
+    const h = nativeResumeAdmissionHarness();
+    const { scope, detector } = h;
+    detector.observeProgramStatus({ state: 'working' });
+    scope.flushPending = h.flush;
+    scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
+    scope.programStatusStream = new ProgramStatusFramingStream();
+    scope.spawnArgvNeedsWorkingSeed = false;
+    scope.traexQuestionBlockReported = () => false;
+    scope.traexQuestionBridgeActive = () => false;
+    const onData = loadWorkerFunction('onPtyData', scope);
+    const report = (state: string, kind?: string) => onData(`\x1b]7501;state=${state}:app=traecli${kind ? `:kind=${kind}` : ''}${owner === 'child' ? ':id=approval-child' : ''}\x1b\\`);
+    let release!: (screen: string) => void;
+    scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const pending = h.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    report('blocked', 'permission');
+    release('◆ Working… (1s • esc to interrupt)');
+    await pending;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(scope.pendingMessages).toHaveLength(1);
+    report('clear');
+    if (owner === 'root') report('working');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(scope.pendingMessages).toEqual([]);
+    expect(scope.isPromptReady).toBe(false);
+  });
+
+  it.each(['permission', 'auth', 'approval', undefined].flatMap(kind =>
+    (['root', 'child'] as const).map(owner => ({ owner, kind })),
+  ))('retains input when $owner blocked ($kind) arrives during capture and retries only after native release', async ({ owner, kind }) => {
+    vi.useFakeTimers();
+    const h = nativeResumeAdmissionHarness();
+    const { scope, detector } = h;
+    detector.observeProgramStatus({ state: 'working' });
+    scope.flushPending = h.flush;
+    scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
+    const head = scope.pendingMessages[0];
+    let release!: (screen: string) => void;
+    scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const pending = h.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scope.backend.captureViewportAsync).toHaveBeenCalledOnce();
+    const readinessRevision = scope.promptReadinessRevision;
+    detector.observeProgramStatus({ state: 'blocked', ...(kind !== undefined ? { kind } : {}), ...(owner === 'child' ? { id: 'approval-child' } : {}) });
+    // Already busy → blocked does not fire onBusy. Do NOT fake a readiness
+    // revoke: the write-edge itself must reject the old working snapshot.
+    expect(scope.promptReadinessRevision).toBe(readinessRevision);
+    release('◆ Working… (1s • esc to interrupt)');
+    await pending;
+    expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(scope.pendingMessages).toEqual([head]);
+    await h.flush();
+    expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    if (owner === 'child') detector.observeProgramStatus({ state: 'clear', id: 'approval-child' });
+    else {
+      detector.observeProgramStatus({ state: 'clear' });
+      detector.observeProgramStatus({ state: 'working' });
+    }
+    await vi.advanceTimersByTimeAsync(201);
+    expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(scope.pendingMessages).toEqual([]);
+    expect(scope.isPromptReady).toBe(false);
+  });
+
+  it.each(['opening composer', 'question capture'].flatMap(phase =>
+    ['permission', 'auth', undefined].map(kind => ({ phase, kind })),
+  ))('rechecks blocked ($kind) before dequeue after awaiting $phase', async ({ phase, kind }) => {
+    vi.useFakeTimers();
+    const h = nativeResumeAdmissionHarness();
+    const { scope, detector } = h;
+    detector.observeProgramStatus({ state: 'working' });
+    scope.flushPending = h.flush;
+    scope.retryTraexAutoModelAdmission = loadWorkerFunction('retryTraexAutoModelAdmission', scope);
+    const head = scope.pendingMessages[0];
+    let release!: (result: any) => void;
+    let awaited;
+    if (phase === 'opening composer') {
+      scope.openingInputBoxSettled = false;
+      scope.inputBoxJudgeable = () => true;
+      awaited = scope.cliAdapter.settleInputBox = vi.fn(async () => undefined)
+        .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    } else {
+      scope.traexQuestionBridgeActive = () => true;
+      awaited = scope.traexQuestionHoldsQueuedWrite = vi.fn(async () => false)
+        .mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    }
+    const pending = h.flush();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(awaited).toHaveBeenCalledOnce();
+    const readinessRevision = scope.promptReadinessRevision;
+    detector.observeProgramStatus({ state: 'blocked', ...(kind !== undefined ? { kind } : {}) });
+    expect(scope.promptReadinessRevision).toBe(readinessRevision);
+    release(phase === 'opening composer' ? undefined : false);
+    await pending;
+    expect(scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    expect(scope.pendingMessages).toEqual([head]);
+    detector.observeProgramStatus({ state: 'clear' });
+    detector.observeProgramStatus({ state: 'working' });
+    await vi.advanceTimersByTimeAsync(201);
+    expect(scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+    expect(scope.pendingMessages).toEqual([]);
+    expect(scope.isPromptReady).toBe(false);
+  });
+
+  it('does not paste or press Enter through the actual TraeX adapter after approval races the capture', async () => {
+    vi.useFakeTimers();
+    const h = nativeResumeAdmissionHarness();
+    const home = mkdtempSync(join(tmpdir(), 'traex-approval-capture-'));
+    const { scope, detector } = h;
+    const previousHome = process.env.TRAE_HOME;
+    process.env.TRAE_HOME = home;
+    try {
+      mkdirSync(join(home, 'cli'), { recursive: true });
+      const input = 'approval-race-follow-up';
+      scope.pendingMessages[0].content = input;
+      detector.observeProgramStatus({ state: 'working' });
+      const writes: Array<{ text: string; block: unknown }> = [];
+      const nativeWorking = '◆ Working… (1s • esc to interrupt)';
+      scope.cliAdapter.writeInput = createCliAdapterSync('traex').writeInput;
+      scope.backend.captureInputState = () => ({ viewport: nativeWorking, cursor: { x: 0, y: 0 } });
+      scope.backend.write = (text: string) => { writes.push({ text, block: detector.programStatusBlock() }); return true; };
+      scope.backend.sendSpecialKeys = (key: string) => {
+        writes.push({ text: key, block: detector.programStatusBlock() });
+        if (key === 'Enter') appendFileSync(traeHistoryPath(), JSON.stringify({ session_id: '11111111-2222-4333-8444-555555555555', text: input, ts: Date.now() / 1000 }) + '\n');
+        return true;
+      };
+      let release!: (screen: string) => void;
+      scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+      const pending = h.flush();
+      await vi.advanceTimersByTimeAsync(0);
+      const readinessRevision = scope.promptReadinessRevision;
+      detector.observeProgramStatus({ state: 'blocked', kind: 'permission' });
+      expect(detector.programStatusBlock()).toMatchObject({ kind: 'permission' });
+      expect(scope.promptReadinessRevision).toBe(readinessRevision);
+      release(nativeWorking);
+      await vi.advanceTimersByTimeAsync(1000);
+      await pending;
+      expect(writes).toEqual([]);
+      expect(scope.pendingMessages).toHaveLength(1);
+    } finally {
+      if (previousHome === undefined) delete process.env.TRAE_HOME;
+      else process.env.TRAE_HOME = previousHome;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('retains the question-answer exception when question status arrives during capture', async () => {
+    const h = nativeResumeAdmissionHarness();
+    h.detector.observeProgramStatus({ state: 'working' });
+    let release!: (screen: string) => void;
+    h.scope.backend.captureViewportAsync.mockImplementationOnce(() => new Promise<string>(resolve => { release = resolve; }));
+    const pending = h.flush();
+    h.detector.observeProgramStatus({ state: 'blocked', kind: 'question' });
+    release('◆ Working… (1s • esc to interrupt)');
+    await pending;
+    expect(h.scope.cliAdapter.writeInput).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ...[true, false].flatMap(bridge => ['permission', 'auth', undefined].map(kind => ({ bridge, kind, duringCapture: false }))),
+    ...['permission', 'auth', undefined].map(kind => ({ bridge: true, kind, duringCapture: true })),
+  ])(
+    'keeps the actual adapter draft without Enter until blocked ($kind) clears (question bridge=$bridge, capture race=$duringCapture)',
+    async ({ bridge, kind, duringCapture }) => {
+      vi.useFakeTimers();
+      const h = nativeResumeAdmissionHarness();
+      const { scope, detector } = h;
+      const home = mkdtempSync(join(tmpdir(), 'traex-late-block-'));
+      const previousHome = process.env.TRAE_HOME;
+      process.env.TRAE_HOME = home;
+      try {
+        mkdirSync(join(home, 'cli'), { recursive: true });
+        detector.observeProgramStatus({ state: 'working' });
+        const input = 'late-block-follow-up';
+        const nativeWorking = '◆ Working… (1s • esc to interrupt)';
+        const writes: Array<{ text: string; block: unknown }> = [];
+        scope.backend.captureInputState = () => ({ viewport: nativeWorking, cursor: { x: 0, y: 0 } });
+        scope.backend.write = (text: string) => { writes.push({ text, block: detector.programStatusBlock() }); return true; };
+        scope.backend.sendSpecialKeys = (key: string) => {
+          writes.push({ text: key, block: detector.programStatusBlock() });
+          if (key === 'Enter') appendFileSync(traeHistoryPath(), JSON.stringify({ session_id: '11111111-2222-4333-8444-555555555555', text: input, ts: Date.now() / 1000 }) + '\n');
+          return true;
+        };
+        const capture = vi.fn(async () => nativeWorking);
+        let releaseCapture!: (screen: string) => void;
+        if (duringCapture) capture.mockImplementationOnce(() => new Promise(resolve => { releaseCapture = resolve; }));
+        Object.assign(scope, {
+          cliLifetimeNonce: 1, TRAEX_QUESTION_DRAFT_WAIT_MS: 5000, TRAEX_QUESTION_DRAFT_POLL_MS: 50,
+          traexQuestionBridgeActive: () => bridge,
+          traexQuestionBlockReported: () => detector.programStatusBlock()?.kind === 'question',
+          traexQuestionCapture: capture, traexQuestionFlowVisible,
+        });
+        const guard = loadWorkerFunction('traexQuestionSubmitGuard', scope)({ turnId: 'next' });
+        let settled = false;
+        const pending = createCliAdapterSync('traex').writeInput(scope.backend, input, { submitGuard: guard })
+          .then(result => { settled = true; return result; });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(writes).toHaveLength(1);
+        expect(writes[0].block).toBeNull();
+        if (duringCapture) {
+          await vi.advanceTimersByTimeAsync(200);
+          expect(capture).toHaveBeenCalledOnce();
+        }
+        detector.observeProgramStatus({ state: 'blocked', ...(kind !== undefined ? { kind } : {}) });
+        if (duringCapture) releaseCapture(nativeWorking);
+        await vi.advanceTimersByTimeAsync(duringCapture ? 50 : 250);
+        expect(writes.filter(write => write.text === 'Enter')).toEqual([]);
+        expect(writes.filter(write => write.text.includes('[200~'))).toHaveLength(1);
+        expect(settled).toBe(false);
+        expect(scope.traexQuestionDraftWaiting).toBe(true);
+        detector.observeProgramStatus({ state: 'clear' });
+        await vi.advanceTimersByTimeAsync(500);
+        expect(await pending).toMatchObject({ submitted: true });
+        expect(writes.filter(write => write.text.includes('[200~'))).toHaveLength(1);
+        expect(writes.filter(write => write.text === 'Enter')).toEqual([{ text: 'Enter', block: null }]);
+        expect(scope.traexQuestionDraftWaiting).toBe(false);
+      } finally {
+        if (previousHome === undefined) delete process.env.TRAE_HOME;
+        else process.env.TRAE_HOME = previousHome;
+        rmSync(home, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('submits an ordinary follow-up during native working without inventing prompt readiness', async () => {
     vi.useFakeTimers();
     const h = nativeResumeAdmissionHarness();
