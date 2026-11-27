@@ -1,3 +1,4 @@
+import * as terminalService from '../src/services/traex-terminal-session.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 import { findTraexRolloutSetByPid } from '../src/services/traex-transcript.js';
@@ -26,7 +27,7 @@ async function blockedCommandHarness() {
   const terminal: PtyHandle = {
     cliPid: 43212,
     write: vi.fn(),
-    sendText: vi.fn((text: string) => { state = idle(text); }),
+    sendText: vi.fn((text: string) => { state = { ...idle(text), cursor: { x: text.length + 2, y: 1 } }; }),
     sendSpecialKeys: vi.fn(() => false),
     captureInputState: () => state,
   };
@@ -45,6 +46,7 @@ async function blockedCommandHarness() {
   const fence = { backend: terminal };
   Object.assign(scope, {
     backend: terminal,
+    traexTerminalBootstrapFailed: (pty: PtyHandle) => (terminalService as any).traexTerminalBootstrapFailed?.(pty) ?? false,
     lastInitConfig: { cliId: 'traex', adoptMode: true },
     isPromptReady: true,
     captureAdoptWriteFence: () => fence,
@@ -97,7 +99,7 @@ describe('TRAE adopt native-command status-query gate', () => {
     expect(h.scope.pendingRawInputs).toEqual([]);
   });
 
-  it.each(['Local background server', 'Embedded process'])('re-drives held raw/bundle after a restored composer (%s)', async host => {
+  it('re-drives held raw/bundle after a clean composer without retrying a failed bootstrap', async () => {
     const h = await blockedCommandHarness();
     const msg = {
       type: 'raw_input', content: '/model', turnId: 'raw-turn',
@@ -106,15 +108,6 @@ describe('TRAE adopt native-command status-query gate', () => {
     await h.scope.deliverRawInput(msg);
     expect(h.scope.pendingRawInputs).toEqual([msg]);
     h.release();
-    const capture = h.terminal.captureInputState!;
-    h.terminal.sendSpecialKeys = vi.fn((key: string) => {
-      if (key === 'Enter') h.terminal.captureInputState = () => ({
-        viewport: `────────────────\n >_ TRAE CLI (v0.216.0)\n\n Execution host: ${host}\n Session: 01a0ec3d-3751-7882-9b25-49bc90078561\n Limits: data not available yet`,
-        cursor: { x: 45, y: 5 },
-      });
-      if (key === 'Escape') { h.terminal.captureInputState = capture; h.release(); }
-      return true;
-    });
     Object.assign(h.scope, {
       structuredBridgeIs: (id: string) => id === 'traex',
       TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS: 1000,
@@ -124,6 +117,7 @@ describe('TRAE adopt native-command status-query gate', () => {
       noteTraexProcessFileSource: vi.fn(),
       codexBridgeRolloutPath: undefined,
       traexTerminalIdentityNeedsRefresh,
+      traexTerminalInputBlocked,
       refreshTraexTerminalSession,
       adoptWriteQueue: { run: (write: () => Promise<void>) => write() },
       persistCliSessionId: vi.fn(),
@@ -137,7 +131,8 @@ describe('TRAE adopt native-command status-query gate', () => {
     expect(h.sendRaw.mock.calls.map(call => call[1])).toEqual(['/model']);
     expect(h.writeAdoptMessage).toHaveBeenCalledOnce();
     expect(h.scope.pendingRawInputs).toEqual([]);
-    expect(h.scope.codexBridgeNotifyCliSessionId).toHaveBeenCalledTimes(host === 'Local background server' ? 1 : 0);
+    expect(h.scope.codexBridgeNotifyCliSessionId).not.toHaveBeenCalled();
+    expect(h.terminal.sendText).toHaveBeenCalledTimes(1);
 
     const queryCount = vi.mocked(h.terminal.sendText!).mock.calls.length;
     poll();
@@ -145,20 +140,11 @@ describe('TRAE adopt native-command status-query gate', () => {
     expect(h.terminal.sendText).toHaveBeenCalledTimes(queryCount);
   });
 
-  it('re-drives a held rename after a negative status result releases the composer', async () => {
+  it('re-drives a held rename after the human clears a failed bootstrap, without reopening status', async () => {
     const h = await blockedCommandHarness();
     h.scope.pendingSessionRename = 'new title';
     h.scope.cliAdapter.buildSessionRenameCommand = (title: string) => `/rename ${title}`;
     h.release();
-    const capture = h.terminal.captureInputState!;
-    h.terminal.sendSpecialKeys = vi.fn((key: string) => {
-      if (key === 'Enter') h.terminal.captureInputState = () => ({
-        viewport: '────────────────\n >_ TRAE CLI (v0.216.0)\n\n Execution host: Embedded process\n Session: 01a0ec3d-3751-7882-9b25-49bc90078561\n Limits: data not available yet',
-        cursor: { x: 45, y: 5 },
-      });
-      if (key === 'Escape') { h.terminal.captureInputState = capture; h.release(); }
-      return true;
-    });
     Object.assign(h.scope, {
       structuredBridgeIs: (id: string) => id === 'traex',
       TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS: 1000,
@@ -168,6 +154,7 @@ describe('TRAE adopt native-command status-query gate', () => {
       noteTraexProcessFileSource: vi.fn(),
       codexBridgeRolloutPath: undefined,
       traexTerminalIdentityNeedsRefresh,
+      traexTerminalInputBlocked,
       refreshTraexTerminalSession,
       adoptWriteQueue: { run: (write: () => Promise<void>) => write() },
       persistCliSessionId: vi.fn(),
@@ -200,5 +187,59 @@ describe('TRAE adopt native-command status-query gate', () => {
     await h.h.flush();
     expect(h.sendRaw).toHaveBeenCalledExactlyOnceWith(h.terminal, '/rename new title');
     expect(h.scope.pendingSessionRename).toBeNull();
+  });
+});
+
+
+describe('TRAE adopted bootstrap failure notification', () => {
+  function harness(needsRefresh = false, resolution: any = { kind: 'unavailable' }) {
+    const terminal = { cliPid: 43212 };
+    const fence = { backend: terminal };
+    let current = true;
+    const send = vi.fn();
+    const scope: any = {
+      backend: terminal, structuredBridgeIs: () => true, lastInitConfig: { adoptMode: true },
+      TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS: 1000, traexBridgePidProbeLastMs: 0,
+      currentTraexObservedPid: () => terminal.cliPid, log: vi.fn(),
+      findTraexRolloutByPid: () => undefined, noteTraexProcessFileSource: vi.fn(),
+      captureAdoptWriteFence: () => fence, adoptWriteFenceIsCurrent: () => current,
+      adapterInputHandle: (b: any) => b,
+      traexTerminalIdentityNeedsRefresh: () => needsRefresh,
+      traexTerminalBootstrapFailed: () => resolution.kind !== 'terminal',
+      traexTerminalInputBlocked: () => true, hasPendingInputForFlush: () => false,
+      refreshTraexTerminalSession: vi.fn(async () => { needsRefresh = false; return resolution; }),
+      adoptWriteQueue: { run: (f: any) => f() },
+      persistCliSessionId: vi.fn(), codexBridgeNotifyCliSessionId: vi.fn(),
+      codexBridgeIngest: vi.fn(), emitReadyCodexTurns: vi.fn(), isPromptReady: true,
+      send,
+    };
+    return { scope, terminal, send, poll: loadWorkerFunction<() => void>('maybeFollowTraexSessionRotationViaPid', scope), cancel: () => { current = false; } };
+  }
+
+  it.each([false, true])('notifies actual failure once across repeated ticks (initial-query=%s)', async initialQuery => {
+    vi.useFakeTimers(); vi.setSystemTime(10000);
+    const h = harness(initialQuery);
+    h.poll(); await vi.runAllTimersAsync();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    expect(h.send.mock.calls[0][0]).toMatchObject({ type: 'user_notify' });
+    expect(h.send.mock.calls[0][0].message).toMatch(/会话/);
+    expect(h.send.mock.calls[0][0].message).toMatch(/(?:结束|完成).*通知/);
+    expect(h.send.mock.calls[0][0].message).toMatch(/重新.*adopt/);
+    vi.setSystemTime(12000); h.poll(); await vi.runAllTimersAsync();
+    expect(h.send).toHaveBeenCalledTimes(1);
+    h.terminal.cliPid++; vi.setSystemTime(14000); h.poll(); await vi.runAllTimersAsync();
+    expect(h.send).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['not-started', 'pending', 'success', 'cancelled'])('does not notify %s discovery', async situation => {
+    vi.useFakeTimers(); vi.setSystemTime(10000);
+    const h = harness(situation === 'success' || situation === 'cancelled', situation === 'success' ? { kind: 'terminal', sessionId: '01a0ec3d-3751-7882-9b25-49bc90078561' } : { kind: 'unavailable' });
+    if (situation === 'not-started' || situation === 'pending') h.scope.traexTerminalBootstrapFailed = () => false;
+    if (situation === 'cancelled') {
+      h.scope.refreshTraexTerminalSession = async () => { h.cancel(); return { kind: 'unavailable' }; };
+    }
+    h.poll(); await vi.runAllTimersAsync();
+    expect(h.send).not.toHaveBeenCalled();
+    if (situation === 'success') expect(h.scope.codexBridgeNotifyCliSessionId).toHaveBeenCalledTimes(1);
   });
 });

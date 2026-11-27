@@ -476,7 +476,7 @@ import { WebTerminalInputController, WebTerminalInputWireState } from './core/we
 import { isTerminalColorQueryOnly } from './core/terminal-color-query.js';
 import { detectCodexComposerState } from './services/codex-composer-state.js';
 import { refreshCodexTerminalSession, codexTerminalSessionIsBound } from './services/codex-terminal-session.js';
-import { refreshTraexTerminalSession, traexTerminalSessionIsBound, traexTerminalIdentityNeedsRefresh, traexTerminalInputBlocked } from './services/traex-terminal-session.js';
+import { refreshTraexTerminalSession, traexTerminalSessionIsBound, traexTerminalIdentityNeedsRefresh, traexTerminalInputBlocked, traexTerminalBootstrapFailed } from './services/traex-terminal-session.js';
 import { splitTraexAdoptEvents } from './services/traex-transcript.js';
 import {
   generateCodexAppThreadTitle,
@@ -13671,6 +13671,7 @@ let antigravitySpawnStartMs: number | undefined;
 let grokBridgePidProbeLastMs = 0;
 const GROK_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
 let traexBridgePidProbeLastMs = 0;
+let traexBootstrapFailureNotices: WeakMap<PtyHandle, number> | undefined;
 const TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS = 5_000;
 /** `<pid>|<source>` of the TRAE fd-access outcome last written to the log. */
 let traexFileSourceLogKey: string | undefined;
@@ -19707,11 +19708,34 @@ function maybeFollowTraexSessionRotationViaPid(): void {
     if (lastInitConfig?.adoptMode) {
       const fence = captureAdoptWriteFence();
       if (!fence) return;
-      if (!traexTerminalIdentityNeedsRefresh(adapterInputHandle(fence.backend))) return;
+      const terminal = adapterInputHandle(fence.backend);
+      const notifyBootstrapFailure = () => {
+        if (!traexTerminalBootstrapFailed(terminal) || codexBridgeRolloutPath
+          || !adoptWriteFenceIsCurrent(fence)) return;
+        const pid = terminal.cliPid;
+        if (!pid) return;
+        const notices = traexBootstrapFailureNotices ??= new WeakMap<PtyHandle, number>();
+        if (notices.get(terminal) === pid) return;
+        notices.set(terminal, pid);
+        send({ type: 'user_notify', message: '接管已连接，但未能确认当前 TRAE 会话，终端任务的完成通知暂时无法同步到飞书。请先清空终端中残留的 /status（如有），再断开并重新 /adopt；无需重启 TRAE' });
+      };
+      if (!traexTerminalIdentityNeedsRefresh(terminal)) {
+        notifyBootstrapFailure();
+        // A failed one-shot bootstrap must not be replayed to release input.
+        // Poll its input gate read-only instead; flushPending rechecks all
+        // admission gates before delivering the held raw command or rename.
+        if (!traexTerminalInputBlocked(terminal) && hasPendingInputForFlush()) {
+          queueMicrotask(() => {
+            if (adoptWriteFenceIsCurrent(fence)) void flushPending();
+          });
+        }
+        return;
+      }
       void adoptWriteQueue.run(async () => {
         if (!adoptWriteFenceIsCurrent(fence)) return;
         const terminal = adapterInputHandle(fence.backend);
-        const resolved = await refreshTraexTerminalSession(terminal, () => adoptWriteFenceIsCurrent(fence));
+        const resolved = await refreshTraexTerminalSession(terminal, () => adoptWriteFenceIsCurrent(fence),
+          (stage, reason) => log(`TRAE bootstrap stopped: pid=${terminal.cliPid ?? 'none'}, stage=${stage}, reason=${reason}`));
         if (!adoptWriteFenceIsCurrent(fence)) return;
         if (resolved.inputReleased) {
           // Raw commands and native rename were held without writing. Release
@@ -19722,7 +19746,7 @@ function maybeFollowTraexSessionRotationViaPid(): void {
             if (adoptWriteFenceIsCurrent(fence)) void flushPending();
           });
         }
-        if (resolved.kind !== 'terminal') return;
+        if (resolved.kind !== 'terminal') { notifyBootstrapFailure(); return; }
         const boundSid = codexBridgeRolloutPath ? traexSessionIdFromRolloutPath(codexBridgeRolloutPath) : undefined;
         if (boundSid !== resolved.sessionId) {
           persistCliSessionId(resolved.sessionId);
@@ -33354,6 +33378,7 @@ async function setupAdoptTranscriptBridges(cfg: Extract<DaemonToWorker, { type: 
         const fence = captureAdoptWriteFence();
         const resolved = fence && await adoptWriteQueue.run(() => refreshTraexTerminalSession(
           adapterInputHandle(fence.backend), () => adoptWriteFenceIsCurrent(fence),
+          (stage, reason) => log(`TRAE bootstrap stopped: stage=${stage}, reason=${reason}`),
         ));
         if (resolved?.kind === 'terminal' && fence && adoptWriteFenceIsCurrent(fence)) {
           persistCliSessionId(resolved.sessionId);

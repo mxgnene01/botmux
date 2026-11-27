@@ -2926,11 +2926,13 @@ export class TmuxPipeBackend implements SessionBackend {
     cursor: { x: number; y: number };
   } | null {
     if (this.exited) return null;
-    const cursor = this.getCursorPosition();
-    if (!cursor) return null;
     try {
-      const viewport = execFileSync(
-        'tmux', [...this.tmuxArgs, 'capture-pane', '-p', '-t', this.paneTarget],
+      // Neither command waits: tmux drains this single client command queue
+      // before processing the next pane-output event. Separate clients can
+      // pair an old caret with a newly painted composer during TUI redraw.
+      const captured = execFileSync(
+        'tmux', [...this.tmuxArgs, 'display-message', '-p', '-t', this.paneTarget,
+          '#{cursor_x} #{cursor_y}', ';', 'capture-pane', '-p', '-t', this.paneTarget],
         {
           encoding: 'utf-8',
           stdio: ['ignore', 'pipe', 'ignore'],
@@ -2939,7 +2941,13 @@ export class TmuxPipeBackend implements SessionBackend {
           env: tmuxEnv(),
         },
       );
-      return { viewport, cursor };
+      const split = captured.indexOf('\n');
+      if (split < 0) return null;
+      const match = /^(\d+) (\d+)\r?$/.exec(captured.slice(0, split));
+      if (!match) return null;
+      const x = Number(match[1]); const y = Number(match[2]);
+      if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y)) return null;
+      return { viewport: captured.slice(split + 1), cursor: { x, y } };
     } catch {
       return null;
     }

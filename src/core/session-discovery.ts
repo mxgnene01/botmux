@@ -20,6 +20,8 @@ import { tmuxEnv } from '../setup/ensure-tmux.js';
 import { herdrExecutable } from '../utils/herdr-executable.js';
 import { herdrPaneGrid } from '../utils/herdr-pane-grid.js';
 import { cleanLiveAdoptTitle } from '../utils/live-title.js';
+import { TRAEX_SPINNER_FRAMES } from '../adapters/cli/traex-footer.js';
+import { stripAnsiScreenText } from '../utils/idle-detector.js';
 import { LSOF_EXEC_OPTIONS } from '../utils/process-open-files.js';
 import { PROCESS_TABLE_MAX_BUFFER } from '../utils/exec-limits.js';
 import { PROC_STAT_STARTTIME_INDEX, procStatFieldsAfterComm } from '../utils/proc-stat.js';
@@ -48,9 +50,11 @@ export interface AdoptableSession {
   paneRows: number;          // current pane height
   /** Display name. Herdr: pane label (any CLI) > Claude terminal title
    *  (generic / path-like titles dropped), cleaned to one line of at most 80
-   *  code points. TraeX (tmux / herdr without a label): the native thread
-   *  title from its state DB, same cleaning, unless the thread is botmux-origin
-   *  (see traexLiveTitle). Absent → callers show the cwd basename. */
+   *  code points. TraeX tmux: visible composer name bar, then OSC pane title
+   *  and its window name; native
+   *  state DB title remains a fallback when display metadata is unavailable.
+   *  Herdr without a label still uses the origin-filtered native thread title.
+   *  Display names never supply session identity. Absent → cwd basename. */
   title?: string;
   /** Herdr workspace / tab holding the pane, copied from the `agent list` /
    *  `pane list` records discovery already reads (no extra herdr call). */
@@ -947,21 +951,22 @@ export function findUniqueClaudeSessionByCwd(cwd: string): { sessionId?: string;
   return matches[0];
 }
 
-/**
- * Get pane dimensions via tmux display command.
- * Returns { cols, rows } or undefined on failure.
- */
-function getPaneDimensions(tmuxTarget: string): { cols: number; rows: number } | undefined {
+/** Dimensions and display-only names from the same exact pane, in one read.
+ * Names come after the numeric header and cannot change process identity. */
+function getTmuxPaneMetadata(tmuxTarget: string): {
+  cols: number; rows: number; windowName?: string; terminalTitle?: string;
+} | undefined {
   try {
     const out = execSync(
-      `tmux display -t ${shellescape(tmuxTarget)} -p '#{pane_width} #{pane_height}'`,
+      `tmux display -t ${shellescape(tmuxTarget)} -p '#{pane_width} #{pane_height}\x1f#{window_name}\x1f#{pane_title}'`,
       { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: tmuxEnv() },
     ).trim();
-    const [colsStr, rowsStr] = out.split(' ');
+    const [dimensions, windowName, ...titleParts] = out.split('\x1f');
+    const [colsStr, rowsStr] = dimensions!.split(' ');
     const cols = Number(colsStr);
     const rows = Number(rowsStr);
     if (isNaN(cols) || isNaN(rows)) return undefined;
-    return { cols, rows };
+    return { cols, rows, windowName, terminalTitle: titleParts.length ? titleParts.join('\x1f') : undefined };
   } catch {
     return undefined;
   }
@@ -1074,6 +1079,53 @@ function herdrAgentSessionId(agent: any): string | undefined {
  * zellij discovery path. */
 export function traexLiveTitle(sessionId: string | undefined): string | undefined {
   return sessionId ? cleanLiveAdoptTitle(readTraexThreadTitle(sessionId)) : undefined;
+}
+
+/** TRAE's OSC title carries a busy spinner and a repeated project suffix.
+ * Use it only as display text; a UUID-looking name is never a source SID. */
+function traexTmuxDisplayTitle(rawTitle: unknown, rawWindowName: unknown, cwd: string, visibleName?: string): string | undefined {
+  const project = basename(cwd);
+  let terminalTitle = cleanLiveAdoptTitle(rawTitle, 4096);
+  terminalTitle = terminalTitle?.replace(new RegExp(`^[${TRAEX_SPINNER_FRAMES}]\\s+`, 'u'), '');
+  const suffix = ` | ${project}`;
+  if (terminalTitle?.endsWith(suffix)) terminalTitle = terminalTitle.slice(0, -suffix.length).trim();
+  const usable = (raw: unknown): string | undefined => {
+    const value = cleanLiveAdoptTitle(raw);
+    if (!value || value === project || value.startsWith('/') || value.startsWith('~')
+      || /^\S+@\S+:[~\/]/.test(value)) return undefined;
+    const generic = ['trae', 'trae cli', 'traex', 'traecli', 'node', 'sh', 'bash', 'zsh', 'fish'];
+    return generic.includes(value.toLowerCase()) ? undefined : value;
+  };
+  return usable(visibleName) ?? usable(terminalTitle) ?? usable(rawWindowName);
+}
+
+/** TRAE's composer name is screen text, not its OSC title. Read only the live
+ * bottom 16 rows of this exact pane; never scrollback or another pane's name.
+ * A complete native name/prompt/lower-rule/status footer is required so an
+ * example, draft continuation or half repaint cannot supply the display name.
+ * This is display-only and does not issue /status or alter session identity. */
+function readTraexTmuxVisibleName(tmuxTarget: string, paneRows: number): string | undefined {
+  try {
+    const screen = execSync(
+      `tmux capture-pane -p -t ${shellescape(tmuxTarget)} -S ${Math.max(0, Math.floor(paneRows) - 16)}`,
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'], env: tmuxEnv(), timeout: 500, maxBuffer: 64 * 1024 },
+    );
+    const rows = stripAnsiScreenText(screen).trimEnd().split(/\r?\n/);
+    let lower = rows.length - 1;
+    while (lower >= 0 && !/^▀{3,}[ \t]*$/.test(rows[lower]!)) lower--;
+    if (lower < 2) return undefined;
+    const footer = rows.slice(lower + 1).filter(row => row.trim());
+    if (footer.length < 1 || footer.length > 2
+      || !/^[ \t]*\S[^\r\n]* · Context (?:\d+% (?:left|used)|—)(?: · [^\r\n]*)?[ \t]*$/.test(footer[0]!)) return undefined;
+    if (footer.length === 2 && !/\? for shortcuts|← for agents|paste again expand/.test(footer[1]!)) return undefined;
+    let composer = lower - 1;
+    while (composer >= 0 && !/^[›❯](?:[ \t]|$)/.test(rows[composer]!)) composer--;
+    if (composer < 1) return undefined;
+    return /^▄{3,}[ \t]+(.+?)[ \t]+▄[ \t]*$/.exec(rows[composer - 1]!)?.[1];
+  } catch {
+    // A missing/hidden name bar retains the existing OSC/window fallback.
+    return undefined;
+  }
 }
 
 /** The Claude terminal title unless it is generic (`Claude Code`, the CLI
@@ -1364,8 +1416,11 @@ function resolveAdoptableSessionForPane(
   }
 
   // 6. Get pane dimensions
-  const dims = getPaneDimensions(tmuxTarget);
+  const dims = getTmuxPaneMetadata(tmuxTarget);
   if (!dims) return undefined;
+  if (match.cliId === 'traex') title = traexTmuxDisplayTitle(
+    dims.terminalTitle, dims.windowName, cwd, readTraexTmuxVisibleName(tmuxTarget, dims.rows),
+  ) ?? title;
 
   return {
     source: 'tmux',

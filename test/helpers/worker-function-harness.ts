@@ -68,7 +68,7 @@ import { pruneRewindBackupsBeside, registerRewindBackup, rewindBackupDirForSessi
 import { readTraexCatalogWithRetry } from '../../src/services/traex-model-catalog-retry.js';
 import { traexAutoModelPolicyKey } from '../../src/services/traex-auto-model.js';
 import { traexStartupInputReady } from '../../src/core/traex-startup-input.js';
-import { traexTerminalInputBlocked } from '../../src/services/traex-terminal-session.js';
+import { traexTerminalInputBlocked, traexTerminalBootstrapFailed } from '../../src/services/traex-terminal-session.js';
 import {
   TRAEX_FIRST_PROMPT_SLOW_POLL_MS,
   TraexFirstPromptReadinessPoller,
@@ -472,6 +472,7 @@ export function loadWorkerFunction<T extends (...args: any[]) => any>(
     if (key === 'antigravityBlockingPageTail') return antigravityBlockingPageTail;
     if (key === 'traexStartupInputReady') return traexStartupInputReady;
     if (key === 'traexTerminalInputBlocked') return traexTerminalInputBlocked;
+    if (key === 'traexTerminalBootstrapFailed') return traexTerminalBootstrapFailed;
     if (key === 'TRAEX_FIRST_PROMPT_SLOW_POLL_MS') return TRAEX_FIRST_PROMPT_SLOW_POLL_MS;
     if (key === 'isTraexWebInputSettled') return isTraexWebInputSettled;
     if (key === 'isValidPaneDimensions') return isValidPaneDimensions;

@@ -242,6 +242,10 @@ function setupMocks(opts: {
   childMap?: Record<number, number[]>;
   cmdlineMap?: Record<number, string[]>;
   dimsMap?: Record<string, string>;
+  /** Read-only display metadata from the same exact pane as the dimensions. */
+  paneNames?: Record<string, { window: string; title: string }>;
+  /** Authoritative current viewport tail, not rollout/history text. */
+  paneScreens?: Record<string, string>;
   claudeMeta?: Record<number, string>;
   /** pid → starttime (clock ticks since boot) for /proc/<pid>/stat field 22.
    *  Drives readProcessStartTime's Linux fast path. Pids absent here yield a
@@ -257,7 +261,7 @@ function setupMocks(opts: {
   /** Actual loaded binary, independent of argv[0] or a retargeted symlink. */
   executableMap?: Record<number, string>;
 }) {
-  const { paneLines, commMap = {}, cwdMap = {}, childMap = {}, cmdlineMap = {}, dimsMap = {}, claudeMeta = {}, statMap = {}, bootTimeSeconds = 1_700_000_000, procFdMap = {}, executableMap = {} } = opts;
+  const { paneLines, commMap = {}, cwdMap = {}, childMap = {}, cmdlineMap = {}, dimsMap = {}, paneNames = {}, paneScreens = {}, claudeMeta = {}, statMap = {}, bootTimeSeconds = 1_700_000_000, procFdMap = {}, executableMap = {} } = opts;
 
   // Replace blanket existsSync / readdirSync mocks with procFdMap-aware ones.
   mockExistsSync.mockImplementation((path: unknown) => {
@@ -279,6 +283,12 @@ function setupMocks(opts: {
 
   mockExecSync.mockImplementation((cmd: unknown) => {
     const cmdStr = String(cmd);
+
+    if (cmdStr.includes('capture-pane')) {
+      const target = /-t '([^']+)'/.exec(cmdStr)?.[1];
+      if (target && target in paneScreens) return paneScreens[target];
+      throw new Error('viewport unavailable');
+    }
 
     const commMatch = cmdStr.match(/^ps -o comm= -p (\d+)$/);
     if (commMatch) {
@@ -330,7 +340,11 @@ function setupMocks(opts: {
 
       // pane dimensions query
       const dims = dimsMap[target];
-      if (dims) return dims;
+      if (dims) {
+        const names = paneNames[target];
+        return names && cmdStr.includes('window_name') && cmdStr.includes('pane_title')
+          ? `${dims}\x1f${names.window}\x1f${names.title}` : dims;
+      }
       throw new Error('pane not found');
     }
 
@@ -1192,6 +1206,139 @@ describe('discoverAdoptableSessions', () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  it('reads a TRAE pane title without a rollout SID and keeps identity fields unchanged', () => {
+    setupMocks({ paneLines: '0:2.1 9100\n', commMap: { 9100: 'traex' }, cwdMap: { 9100: '/workspace/notes' },
+      dimsMap: { '0:2.1': '208 153' }, paneNames: { '0:2.1': { window: 'notes', title: '⠏ 个人笔记:notes | notes' } },
+    });
+    const [s] = discoverAdoptableSessions('traex');
+    expect(s).toMatchObject({ title: '个人笔记:notes', cliId: 'traex', cliPid: 9100, panePid: 9100, tmuxTarget: '0:2.1', cwd: '/workspace/notes', paneCols: 208, paneRows: 153 });
+    expect(s.sessionId).toBeUndefined();
+    const commands = mockExecSync.mock.calls.map(([cmd]) => String(cmd));
+    expect(commands.filter(cmd => cmd.includes('pane_width'))).toHaveLength(1);
+    expect(commands.some(cmd => cmd.includes('send-keys'))).toBe(false);
+  });
+
+  it('distinguishes same-directory TRAE panes by terminal title and window fallback', () => {
+    setupMocks({ paneLines: '0:3.1 9200\n0:4.1 9300\n', commMap: { 9200: 'traex', 9300: 'traex' },
+      cwdMap: { 9200: '/workspace/work', 9300: '/workspace/work' }, dimsMap: { '0:3.1': '120 30', '0:4.1': '120 30' },
+      paneNames: { '0:3.1': { window: 'work1', title: 'work:bot-alpha | work' }, '0:4.1': { window: 'work2', title: 'work | work' } },
+    });
+    const candidates = discoverAdoptableSessions('traex');
+    expect(candidates.map(s => [s.title, s.tmuxTarget, s.cliPid, s.sessionId])).toEqual([
+      ['work:bot-alpha', '0:3.1', 9200, undefined], ['work2', '0:4.1', 9300, undefined],
+    ]);
+  });
+
+  it.each(['', 'TRAE CLI | work', 'traex', '/workspace/work', 'developer@host:~/work'])(
+    'uses the window name rather than a generic/path terminal title (%s)', title => {
+      setupMocks({ paneLines: '0:4.1 9300\n', commMap: { 9300: 'traex' }, cwdMap: { 9300: '/workspace/work' },
+        dimsMap: { '0:4.1': '120 30' }, paneNames: { '0:4.1': { window: 'work2', title } },
+      });
+      expect(discoverAdoptableSessions('traex')[0].title).toBe('work2');
+    },
+  );
+
+  it('does not promote a UUID-looking terminal title into source identity', () => {
+    const name = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    setupMocks({ paneLines: '0:4.1 9300\n', commMap: { 9300: 'traex' }, cwdMap: { 9300: '/workspace/work' },
+      dimsMap: { '0:4.1': '120 30' }, paneNames: { '0:4.1': { window: 'work2', title: name + ' | work' } },
+    });
+    const [candidate] = discoverAdoptableSessions('traex');
+    expect(candidate.title).toBe(name); expect(candidate.sessionId).toBeUndefined();
+  });
+
+  it('caps and cleans display text while keeping the actual target selectable', () => {
+    setupMocks({ paneLines: '0:2.1 9100\n', commMap: { 9100: 'traex' }, cwdMap: { 9100: '/workspace/work' },
+      dimsMap: { '0:2.1': '120 30' }, paneNames: { '0:2.1': { window: 'work1', title: '⠋ 项目<名称>\n' + '😀'.repeat(90) + ' | work' } },
+    });
+    const [candidate] = discoverAdoptableSessions('traex');
+    expect(candidate.title?.startsWith('项目名称 ')).toBe(true);
+    expect(Array.from(candidate.title!)).toHaveLength(80);
+    expect(candidate.title?.endsWith('…')).toBe(true);
+    expect(candidate.title).not.toMatch(/[<>\n]/);
+    expect(candidate.tmuxTarget).toBe('0:2.1');
+  });
+
+  describe('TRAE visible name bar', () => {
+    const surface = (name: string, prompt = 'Summarize recent commits') => [
+      '▄'.repeat(60) + ' ' + name + ' ▄', '❯ ' + prompt, '▀'.repeat(80),
+      '  GPT-6.1-Sol high · ~/mxg/work · Context 28% left', '  ? for shortcuts',
+    ].join('\n');
+    const setup = (screen?: string, title = 'work') => setupMocks({
+      paneLines: '0:3.1 9200\n', commMap: { 9200: 'traex' }, cwdMap: { 9200: '/workspace/work' },
+      dimsMap: { '0:3.1': '213 153' }, paneNames: { '0:3.1': { window: 'work1', title } },
+      paneScreens: screen === undefined ? {} : { '0:3.1': screen },
+    });
+
+    it('uses the visible TRAE name when OSC title is only the directory', () => {
+      setup(surface('work:bot-alpha'));
+      const [listed] = discoverAdoptableSessions('traex');
+      const direct = discoverAdoptableSessionByTarget('0:3.1', 'traex');
+      for (const s of [listed, direct]) {
+        expect(s).toMatchObject({ title: 'work:bot-alpha', tmuxTarget: '0:3.1', cliPid: 9200, cwd: '/workspace/work' });
+        expect(s?.sessionId).toBeUndefined();
+      }
+      const commands = mockExecSync.mock.calls.map(([cmd]) => String(cmd));
+      expect(commands.some(cmd => /send-keys|\/status/.test(cmd))).toBe(false);
+    });
+
+    it('prefers the stable visible name over an automatically generated OSC task title', () => {
+      setup(surface('work:bot-alpha'), '⠋ 修复之前的任务 | work');
+      expect(discoverAdoptableSessions('traex')[0].title).toBe('work:bot-alpha');
+    });
+
+    it('keeps same-directory panes separate using their own live name bars', () => {
+      setupMocks({ paneLines: '0:3.1 9200\n0:4.1 9300\n', commMap: { 9200: 'traex', 9300: 'traex' },
+        cwdMap: { 9200: '/workspace/work', 9300: '/workspace/work' }, dimsMap: { '0:3.1': '213 153', '0:4.1': '213 153' },
+        paneNames: { '0:3.1': { window: 'work1', title: 'work' }, '0:4.1': { window: 'work2', title: 'other task | work' } },
+        paneScreens: { '0:3.1': surface('work:bot-alpha'), '0:4.1': surface('work2:bot-beta') },
+      });
+      expect(discoverAdoptableSessions('traex').map(s => [s.title, s.tmuxTarget, s.cliPid])).toEqual([
+        ['work:bot-alpha', '0:3.1', 9200], ['work2:bot-beta', '0:4.1', 9300],
+      ]);
+    });
+
+    it('reads a name without disturbing a nonempty multiline composer', () => {
+      setup(surface('work:bot-alpha', 'my unsent draft\n  another unsent line'));
+      expect(discoverAdoptableSessions('traex')[0].title).toBe('work:bot-alpha');
+      expect(mockExecSync.mock.calls.some(([cmd]) => String(cmd).includes('send-keys'))).toBe(false);
+    });
+
+    it('cleans and caps native names without making a UUID into a source SID', () => {
+      const name = '01a0ec3d-3751-7882-9b25-49bc90078561';
+      setup(surface(name));
+      const s = discoverAdoptableSessions('traex')[0];
+      expect(s.title).toBe(name); expect(s.sessionId).toBeUndefined();
+      setup(surface('\x1b[1m项目<名称>' + '😀'.repeat(90) + '\x1b[0m'));
+      const cleaned = discoverAdoptableSessions('traex')[0].title!;
+      expect(cleaned.startsWith('项目名称')).toBe(true); expect(Array.from(cleaned)).toHaveLength(80);
+      expect(cleaned).not.toMatch(/[<>\x1b]/);
+    });
+
+    it.each([
+      surface('wrong history name') + '\nA quoted example ends here\n❯ Summarize recent commits\n───\n  model · Context 28% left\n  ? for shortcuts',
+      '  ' + surface('indented transcript name').replace(/\n/g, '\n  '),
+      surface('incomplete repaint').replace('Context 28% left', 'unknown layout'),
+      surface('overlay name') + '\nSelect Model\nenter confirm | esc go back',
+    ])('keeps OSC fallback for a quoted, incomplete or non-composer name bar', screen => {
+      setup(screen, '可信终端标题 | work');
+      expect(discoverAdoptableSessions('traex')[0].title).toBe('可信终端标题');
+    });
+
+    it('keeps the existing fallback when capture is unavailable', () => {
+      setup(undefined, '原终端标题 | work');
+      expect(discoverAdoptableSessions('traex')[0].title).toBe('原终端标题');
+    });
+
+    it('does not read a native TRAE name from another CLI', () => {
+      setupMocks({ paneLines: '0:3.1 9200\n', commMap: { 9200: 'codex' }, cwdMap: { 9200: '/workspace/work' },
+        dimsMap: { '0:3.1': '213 153' }, paneScreens: { '0:3.1': surface('wrong name') },
+      });
+      expect(discoverAdoptableSessions('codex')[0].title).toBeUndefined();
+      expect(mockExecSync.mock.calls.some(([cmd]) => String(cmd).includes('capture-pane'))).toBe(false);
+    });
   });
 
   it('returns traex discovery without sessionId when no rollout fd is open', () => {

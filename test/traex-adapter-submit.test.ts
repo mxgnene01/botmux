@@ -175,13 +175,14 @@ describe.sequential('TRAE adapter submit verification (history.jsonl)', () => {
       cliPid: process.pid,
       write: vi.fn(),
       pasteText: vi.fn(),
-      sendText: vi.fn((text: string) => { state = idleViewport(text); }),
+      sendText: vi.fn((text: string) => { state = { ...idleViewport(text), cursor: { x: text.length + 2, y: 1 } }; }),
       // A failed Enter leaves the /status draft in the composer and the query unconfirmed.
       sendSpecialKeys: vi.fn(() => false),
       captureInputState: () => state,
     };
     const resolution = await refreshTraexTerminalSession(pty);
     expect(resolution).toEqual({ kind: 'unavailable' });
+    expect(pty.sendSpecialKeys).toHaveBeenCalledExactlyOnceWith('Enter');
 
     const blocked = await createTraexAdapter().writeInput(pty, 'queued task');
     expect(blocked).toMatchObject({ submitted: false });
