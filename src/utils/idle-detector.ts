@@ -471,10 +471,12 @@ export class IdleDetector {
    * screen, and `done`/`idle`/`error` complete the turn without the 2s wait.
    * `blocked` never completes the turn — that would flush queued input into
    * a permission or question prompt.
+   * Returns whether THIS report was admitted to authoritative processing.
+   * Startup/input-cycle reports can still update lastRootReport while false.
    */
-  observeProgramStatus(event: ProgramStatusEvent): void {
-    if (!PROGRAM_STATUS_STATES.has(event.state)) return;
-    if (event.id !== undefined && !isProgramStatusId(event.id)) return;
+  observeProgramStatus(event: ProgramStatusEvent): boolean {
+    if (!PROGRAM_STATUS_STATES.has(event.state)) return false;
+    if (event.id !== undefined && !isProgramStatusId(event.id)) return false;
     // A terminal report the CLI sends before its composer accepts input
     // (omp: InteractiveMode.init() reports idle ahead of session_start hooks)
     // must not release the queued first prompt. Leave startup on the screen
@@ -485,7 +487,7 @@ export class IdleDetector {
       && !this.firstIdlePublished
       && (event.state === 'idle' || event.state === 'done' || event.state === 'error')
     ) {
-      return;
+      return false;
     }
     if (event.id === undefined) this.lastRootReport = event;
     const busyReport = event.state === 'working' || event.state === 'blocked';
@@ -494,9 +496,9 @@ export class IdleDetector {
       // idle on its provisional composer (#3289), both CLIs report working
       // while MCP servers boot although input is accepted, and a resumed
       // TraeX reports idle in the very burst that draws its session-lock page.
-      if (!this.inputCycleStarted) return;
+      if (!this.inputCycleStarted) return false;
       if (this.awaitingCycleBusy) {
-        if (!busyReport) return;
+        if (!busyReport) return false;
         this.awaitingCycleBusy = false;
       }
     }
@@ -515,19 +517,19 @@ export class IdleDetector {
         // a static approval dialog may already be painted. Keep authority until
         // the busy report or the submit deadline.
         if (!this.armSubmitBusyFallback()) this.exitProgramStatusAuthority();
-        return;
+        return true;
       }
       this.deleteProgramStatusSubtree(event.id);
       if (this.programStatusRecords.size === 0 && this.evictedBusyIds.size === 0) {
         if (!this.armSubmitBusyFallback()) {
           this.exitProgramStatusAuthority();
         }
-        return;
+        return true;
       }
       this.programStatusAuthority = true;
       this.clearProgramStatusFallback();
       this.applyProgramStatus();
-      return;
+      return true;
     }
 
     const id = event.id ?? '';
@@ -540,6 +542,7 @@ export class IdleDetector {
     this.programStatusAuthority = true;
     this.clearProgramStatusFallback();
     this.applyProgramStatus();
+    return true;
   }
 
   programStatusActive(): boolean {

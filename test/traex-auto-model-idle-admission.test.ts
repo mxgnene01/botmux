@@ -79,6 +79,50 @@ function nativeResumeAdmissionHarness() {
 }
 
 describe('auto-model admission while a native TraeX turn resumes', () => {
+  it.each([
+    { name: 'rejected working id', payload: 'state=working:app=traecli:id=bad//id', live: true, accepted: false },
+    { name: 'rejected clear id', payload: 'state=clear:app=traecli:id=bad//id', live: true, accepted: false },
+    { name: 'working replay', payload: 'state=working:app=traecli', live: false, accepted: false },
+    { name: 'clear replay', payload: 'state=clear:app=traecli:id=child', live: false, accepted: false },
+    { name: 'invalid state', payload: 'state=bogus:app=traecli', live: true, accepted: false },
+    { name: 'live working', payload: 'state=working:app=traecli', live: true, accepted: true },
+    { name: 'live clear', payload: 'state=clear:app=traecli:id=child', live: true, accepted: true },
+  ])('redrives only an accepted live status ($name), not cached working alone', async ({ payload, live, accepted }) => {
+    vi.useFakeTimers();
+    const h = nativeResumeAdmissionHarness();
+    const { scope, detector } = h;
+    detector.observeProgramStatus({ state: 'working' });
+    Object.assign(scope, {
+      programStatusStream: new ProgramStatusFramingStream(), spawnArgvNeedsWorkingSeed: false,
+      traexQuestionBlockReported: () => false, traexQuestionBridgeActive: () => false,
+      handlePtyDataChunk: vi.fn(), flushPending: vi.fn(h.flush),
+    });
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    loadWorkerFunction('onPtyData', scope)(`\x1b]7501;${payload}\x1b\\`, live);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(scope.flushPending).toHaveBeenCalledTimes(accepted ? 1 : 0);
+    expect(scope.cliAdapter.writeInput).toHaveBeenCalledTimes(accepted ? 1 : 0);
+    expect(scope.pendingMessages).toHaveLength(accepted ? 0 : 1);
+  });
+
+  it('does not redrive a native report ignored before the first input cycle', async () => {
+    vi.useFakeTimers();
+    const h = nativeResumeAdmissionHarness();
+    const detector = h.scope.idleDetector = new IdleDetector(createCliAdapterSync('traex'));
+    Object.assign(h.scope, {
+      programStatusStream: new ProgramStatusFramingStream(), spawnArgvNeedsWorkingSeed: false,
+      traexQuestionBlockReported: () => false, traexQuestionBridgeActive: () => false,
+      flushPending: vi.fn(h.flush),
+    });
+    loadWorkerFunction('onPtyData', h.scope)('\x1b]7501;state=working:app=traecli\x1b\\');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(detector.lastProgramStatusReport()).toBe('working');
+    expect(detector.programStatusHeldWorking()).toBe(false);
+    expect(h.scope.flushPending).not.toHaveBeenCalled();
+    expect(h.scope.cliAdapter.writeInput).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
   it.each(['permission', 'auth', undefined])('refuses the admission snapshot itself when blocked (%s) arrives during capture', async kind => {
     const h = nativeResumeAdmissionHarness();
     h.detector.observeProgramStatus({ state: 'working' });

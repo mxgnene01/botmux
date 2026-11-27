@@ -30,6 +30,52 @@ describe('IdleDetector program status', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
 
+  it.each(['idle', 'working', 'done', 'blocked', 'error'] as const)('reports acceptance for a valid %s state', state => {
+    const detector = new IdleDetector(makeCli());
+    expect(detector.observeProgramStatus({ state, kind: 'permission' })).toBe(true);
+    detector.dispose();
+  });
+
+  it.each(['root', 'last child', 'child with root'] as const)('reports acceptance when clear removes %s records', which => {
+    const detector = new IdleDetector(makeCli());
+    if (which !== 'last child') detector.observeProgramStatus({ state: 'working' });
+    if (which !== 'root') detector.observeProgramStatus({ state: 'working', id: 'child' });
+    expect(detector.observeProgramStatus({ state: 'clear', ...(which !== 'root' ? { id: 'child' } : {}) })).toBe(true);
+    expect(detector.programStatusHeldWorking()).toBe(which === 'child with root');
+    detector.dispose();
+  });
+
+  it('rejects an invalid ID even while a previous accepted working record remains active', () => {
+    const detector = new IdleDetector(makeCli());
+    expect(detector.observeProgramStatus({ state: 'working' })).toBe(true);
+    expect(detector.observeProgramStatus({ state: 'working', id: 'bad//id' })).toBe(false);
+    expect(detector.programStatusHeldWorking()).toBe(true);
+    detector.dispose();
+  });
+
+  it('reports rejection for untrusted startup terminal reports without engaging authority', () => {
+    const detector = new IdleDetector({ ...makeCli(), programStatusStartupIdleUntrusted: true });
+    for (const state of ['idle', 'done', 'error'] as const) expect(detector.observeProgramStatus({ state })).toBe(false);
+    expect(detector.programStatusActive()).toBe(false);
+    expect(detector.observeProgramStatus({ state: 'working' })).toBe(true);
+    detector.dispose();
+  });
+
+  it('distinguishes remembered root reports from accepted input-cycle authority', () => {
+    const beforeInput = new IdleDetector({ ...makeCli(), programStatusFollowsInputCycle: true });
+    expect(beforeInput.observeProgramStatus({ state: 'working' })).toBe(false);
+    expect(beforeInput.lastProgramStatusReport()).toBe('working');
+    expect(beforeInput.programStatusActive()).toBe(false);
+    beforeInput.dispose();
+    const awaitingBusy = new IdleDetector({ ...makeCli(), programStatusFollowsInputCycle: true });
+    awaitingBusy.reset({ inputCycle: true });
+    expect(awaitingBusy.observeProgramStatus({ state: 'idle' })).toBe(false);
+    expect(awaitingBusy.programStatusActive()).toBe(false);
+    expect(awaitingBusy.observeProgramStatus({ state: 'working' })).toBe(true);
+    expect(awaitingBusy.programStatusHeldWorking()).toBe(true);
+    awaitingBusy.dispose();
+  });
+
   it('keeps heuristics until the first accepted report', () => {
     const detector = new IdleDetector(makeCli());
     const cb = vi.fn();

@@ -27635,7 +27635,7 @@ function onPtyData(data: string, isLiveStream = true): void {
         spawnArgvTurnStartBusyScanTail = '';
       }
       const wasAuthoritative = idleDetector?.programStatusActive() ?? false;
-      idleDetector?.observeProgramStatus(part.event);
+      const statusAccepted = idleDetector?.observeProgramStatus(part.event) === true;
       if (part.event.state === 'working' && cliAdapter?.stuckPageFamily === 'kimi') {
         kimiCacheExpiry?.programStatusWorking();
       }
@@ -27647,7 +27647,8 @@ function onPtyData(data: string, isLiveStream = true): void {
       // A blocked native wake can outlive the admission retry. Working/clear
       // need not emit onBusy when the detector was already busy: re-drive the
       // retained head from this accepted state edge, through ALL flush gates.
-      if ((part.event.state === 'working' || part.event.state === 'clear')
+      if (isLiveStream && statusAccepted
+        && (part.event.state === 'working' || part.event.state === 'clear')
         && lastInitConfig?.cliId === 'traex' && traexAutoModelRuntimeEligible()
         && pendingMessages.length > 0 && idleDetector?.programStatusHeldWorking() === true) {
         void flushPending();
